@@ -5,9 +5,10 @@ from pydantic import BaseModel, EmailStr, Field
 from typing import List, Optional
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
-from passlib.context import CryptContext
-import sqlite3
 import os
+
+# Import database logic from db.py
+from . import db
 
 # App-level metadata for OpenAPI
 app = FastAPI(
@@ -30,58 +31,13 @@ app.add_middleware(
 )
 
 # --- CONFIGURATION, CONSTANTS ---
-DATABASE_URL = os.getenv("SQLITE_DB", "tasktrackr.sqlite")
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-me")  # Should be set in production env!
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
 
-# --- DATABASE UTILS ---
-def get_db():
-    db = sqlite3.connect(DATABASE_URL)
-    db.row_factory = sqlite3.Row
-    return db
-
-def init_db():
-    db = get_db()
-    cursor = db.cursor()
-    # User table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-    """)
-    # Task table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            description TEXT,
-            due_date TEXT,
-            completed INTEGER DEFAULT 0 NOT NULL,
-            user_id INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        )
-    """)
-    db.commit()
-    db.close()
-
-init_db()
-
 # --- UTILITY FUNCTIONS ---
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
-
-def hash_password(password):
-    return pwd_context.hash(password)
-
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
@@ -89,17 +45,6 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-def get_user_by_email(email: str):
-    db = get_db()
-    user = db.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
-    db.close()
-    return user
-
-def get_user_by_id(user_id: int):
-    db = get_db()
-    user = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-    db.close()
-    return user
 
 # --- MODELS ---
 class UserRegistration(BaseModel):
@@ -145,12 +90,13 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
     )
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: int = payload.get("sub")
+        user_id = payload.get("sub")
         if user_id is None:
             raise credentials_exception
+        user_id = int(user_id)
     except JWTError:
         raise credentials_exception
-    user = get_user_by_id(user_id)
+    user = db.get_user_by_id(user_id)
     if user is None:
         raise credentials_exception
     return user
@@ -167,21 +113,10 @@ def register(user: UserRegistration):
     - **password**: password (min 6 chars)
     Returns the new user id and email.
     """
-    db = get_db()
-    if get_user_by_email(user.email):
-        db.close()
+    res = db.create_user(user.email, user.password)
+    if res is None:
         raise HTTPException(status_code=409, detail="Email already registered")
-    password_hash = hash_password(user.password)
-    now_str = datetime.utcnow().isoformat()
-    cursor = db.cursor()
-    cursor.execute(
-        "INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?)",
-        (user.email, password_hash, now_str)
-    )
-    db.commit()
-    user_id = cursor.lastrowid
-    db.close()
-    return {"id": user_id, "email": user.email}
+    return {"id": res["id"], "email": res["email"]}
 
 # PUBLIC_INTERFACE
 @app.post("/token", response_model=Token, tags=["auth"], summary="Login (token-based)")
@@ -193,10 +128,10 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
     - **password**: password
     Returns a Bearer access token on success.
     """
-    user = get_user_by_email(form_data.username)
-    if not user or not verify_password(form_data.password, user["password_hash"]):
+    user_row = db.get_user_by_email(form_data.username)
+    if not user_row or not db.verify_password(form_data.password, user_row["password_hash"]):
         raise HTTPException(status_code=400, detail="Incorrect email or password")
-    access_token = create_access_token(data={"sub": user["id"]})
+    access_token = create_access_token(data={"sub": user_row["id"]})
     return {"access_token": access_token, "token_type": "bearer"}
 
 # --- API: TASKS ---
@@ -207,26 +142,13 @@ def create_task(task: TaskCreate, current_user=Depends(get_current_user)):
     """
     Create a new task for the authenticated user.
     """
-    db = get_db()
-    now_str = datetime.utcnow().isoformat()
-    task_due = task.due_date.isoformat() if task.due_date else None
-    cursor = db.cursor()
-    cursor.execute(
-        "INSERT INTO tasks (title, description, due_date, completed, user_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
-        (
-            task.title,
-            task.description,
-            task_due,
-            int(task.completed or False),
-            current_user["id"],
-            now_str,
-            now_str,
-        ),
+    row = db.create_task_for_user(
+        user_id=current_user["id"],
+        title=task.title,
+        description=task.description,
+        due_date=task.due_date,
+        completed=task.completed or False,
     )
-    db.commit()
-    task_id = cursor.lastrowid
-    row = db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
-    db.close()
     return _row_to_taskread(row)
 
 # PUBLIC_INTERFACE
@@ -235,12 +157,7 @@ def list_tasks(current_user=Depends(get_current_user)):
     """
     List all tasks for the authenticated user.
     """
-    db = get_db()
-    rows = db.execute(
-        "SELECT * FROM tasks WHERE user_id = ? ORDER BY due_date IS NULL, due_date ASC, created_at DESC",
-        (current_user["id"],)
-    ).fetchall()
-    db.close()
+    rows = db.get_tasks_for_user(current_user["id"])
     return [_row_to_taskread(row) for row in rows]
 
 # PUBLIC_INTERFACE
@@ -249,12 +166,7 @@ def get_task(task_id: int, current_user=Depends(get_current_user)):
     """
     Get a single task by ID (must belong to authenticated user).
     """
-    db = get_db()
-    row = db.execute(
-        "SELECT * FROM tasks WHERE id = ? AND user_id = ?",
-        (task_id, current_user["id"])
-    ).fetchone()
-    db.close()
+    row = db.get_task_by_id_for_user(task_id, current_user["id"])
     if row is None:
         raise HTTPException(status_code=404, detail="Task not found")
     return _row_to_taskread(row)
@@ -265,40 +177,16 @@ def update_task(task_id: int, update: TaskUpdate, current_user=Depends(get_curre
     """
     Update a task (partial update, fields in body are optional).
     """
-    db = get_db()
-    row = db.execute(
-        "SELECT * FROM tasks WHERE id = ? AND user_id = ?",
-        (task_id, current_user["id"])
-    ).fetchone()
-    if row is None:
-        db.close()
-        raise HTTPException(status_code=404, detail="Task not found")
-    updated = dict(row)
-    # Only update changed fields
-    for field in ['title', 'description', 'due_date', 'completed']:
-        val = getattr(update, field, None)
-        if val is not None:
-            if field == 'due_date' and val:
-                updated[field] = val.isoformat()
-            elif field == 'completed' and val is not None:
-                updated[field] = int(val)
-            else:
-                updated[field] = val
-    now_str = datetime.utcnow().isoformat()
-    db.execute(
-        "UPDATE tasks SET title=?, description=?, due_date=?, completed=?, updated_at=? WHERE id=?",
-        (
-            updated['title'],
-            updated['description'],
-            updated['due_date'],
-            updated.get('completed', 0),
-            now_str,
-            task_id,
-        )
+    row = db.update_task_for_user(
+        task_id=task_id,
+        user_id=current_user["id"],
+        title=update.title if update.title is not None else None,
+        description=update.description if update.description is not None else None,
+        due_date=update.due_date if update.due_date is not None else None,
+        completed=update.completed if update.completed is not None else None,
     )
-    db.commit()
-    row = db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
-    db.close()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Task not found")
     return _row_to_taskread(row)
 
 # PUBLIC_INTERFACE
@@ -307,22 +195,16 @@ def delete_task(task_id: int, current_user=Depends(get_current_user)):
     """
     Delete a task by its ID (must belong to authenticated user).
     """
-    db = get_db()
-    row = db.execute(
-        "SELECT * FROM tasks WHERE id = ? AND user_id = ?",
-        (task_id, current_user["id"])
-    ).fetchone()
-    if row is None:
-        db.close()
+    ok = db.delete_task_for_user(task_id, current_user["id"])
+    if not ok:
         raise HTTPException(status_code=404, detail="Task not found")
-    db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-    db.commit()
-    db.close()
     return
 
 # -- UTILITY: Mapping DB result to Pydantic --
 def _row_to_taskread(row):
     # Converts row (sqlite3.Row) into TaskRead model, handling types (esp. for bool fields and datetimes)
+    if row is None:
+        return None
     return TaskRead(
         id=row["id"],
         title=row["title"],
